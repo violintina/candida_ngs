@@ -1,0 +1,362 @@
+#!/bin/bash
+#SBATCH --job-name=candida_project
+#SBATCH --cpus-per-task=6
+#SBATCH --mem=20G
+
+### create an env
+
+mamba create -n new_candida_project fastqc fastp multiqc bwa samtools bcftools vep plink
+
+### GROUPING FILES BY SAMPLES AND DIRECTION
+
+output_dir="/nfs/home/volkhovskaya/samples"
+
+sample_numbers=($(find /nfs/home/volkhovskaya/reads -type f -name "*.fastq.gz" | sed -n 's/.*C\([0-9]\+\)-.*/\1/p' | sort -u))
+
+for number in "${sample_numbers[@]}"; do
+    echo "Processing Sample C${number}"
+
+    # Process forward reads
+    forward_reads=$(find /nfs/home/volkhovskaya/reads -type f -name "*C${number}-*R1*.fastq.gz")
+    cat $forward_reads > "${output_dir}/C${number}_R1.fastq.gz"
+    if [ -e "${output_dir}/C${number}_R1.fastq.gz" ]; then
+        echo "Successfully created ${output_dir}/C${number}_R1.fastq.gz"
+    else
+        echo "Error: Unable to create ${output_dir}/C${number}_R1.fastq.gz"
+    fi
+
+    # Process reverse reads
+    reverse_reads=$(find /nfs/home/volkhovskaya/reads -type f -name "*C${number}-*R2*.fastq.gz")
+    cat $reverse_reads > "${output_dir}/C${number}_R2.fastq.gz"
+    if [ -e "${output_dir}/C${number}_R2.fastq.gz" ]; then
+        echo "Successfully created ${output_dir}/C${number}_R2.fastq.gz"
+    else
+        echo "Error: Unable to create ${output_dir}/C${number}_R2.fastq.gz"
+    fi
+
+    echo "$(date) - Finished processing Sample C${number}"
+done
+
+echo "files grouping completed."
+
+### QC FOR UNTRIMMED FILES
+
+input_folder="/nfs/home/volkhovskaya/samples"
+
+# Iterate over each fastq.gz file in the folder
+for file in "$input_folder"/*.fastq.gz; do
+    # Run FastQC on each file
+    fastqc "$file"
+done
+
+multiqc -- interactive "$input_folder"
+
+### TRIMMING READS WITH FASTP
+
+# Set the path to the data directory
+DATApath="/nfs/home/volkhovskaya/samples"
+
+# Set the path to the output directory
+TRIMpath="/nfs/home/volkhovskaya/trimmed_reads"
+
+# Find all sample IDs based on the available files in the samples folder
+samples=($(find "$DATApath" -type f -name "*_R1.fastq.gz" | sed -n 's/.*\/C\([0-9]\+\)_R1.fastq.gz/\1/p' | sort -u))
+
+# Iterate over each sample
+for sampleID in "${samples[@]}"; do
+
+    # Define file paths for each pair of reads
+    DATA1="${DATApath}/C${sampleID}_R1.fastq.gz"
+    DATA2="${DATApath}/C${sampleID}_R2.fastq.gz"
+    TRIM1="${TRIMpath}/C${sampleID}_R1_fastp.fastq.gz"
+    TRIM2="${TRIMpath}/C${sampleID}_R2_fastp.fastq.gz"
+
+    # Run fastp for trimming
+    fastp --in1 "$DATA1" --out1 "$TRIM1" --in2 "$DATA2" --out2 "$TRIM2" \
+          --json "${TRIMpath}/C${sampleID}.json" --html "${TRIMpath}/C${sampleID}.html" \
+          --trim_front1 15 --trim_front2 15 --trim_tail1 2 --trim_tail2 2 --detect_adapter_for_pe \
+          --overrepresentation_analysis --thread 5 --report_title "C${sampleID}"
+
+done
+
+echo "Trimming completed."
+
+### QC AFTER TRIMMING
+
+# Set the path to the trimmed reads directory
+TRIMpath="/nfs/home/volkhovskaya/trimmed_reads"
+
+# Set the path to the output directory
+QCpath="/nfs/home/volkhovskaya/qc_reports_trimmed"
+
+# Create the output directory if it doesn't exist
+mkdir -p "$QCpath"
+
+# Run FastQC for each trimmed read file
+fastqc -o "$QCpath" "$TRIMpath"/*.fastq.gz
+
+echo date
+
+# Run MultiQC to generate a summary report
+multiqc -o "$QCpath" "$QCpath"
+
+echo "FastQC and MultiQC completed."
+
+### REF GENOME INDEXING
+
+ref_path="/nfs/home/volkhovskaya/reference/GCA_002759435.2_Cand_auris_B8441_V2_genomic.fna"
+
+bwa mem index ref_path
+
+samtools faidx ref_path
+
+### ALIGNMENT TO REF GENOME
+
+echo "$(date) - Starting BWA alignment process."
+
+ref_path="/nfs/home/volkhovskaya/reference/GCA_002759435.2_Cand_auris_B8441_V2_genomic.fna"
+samplesheet="sample_sheet.txt"
+output_folder="/nfs/home/volkhovskaya/aligning_reads"
+threads=$SLURM_JOB_CPUS_PER_TASK
+
+while read -r sample_name r1_file r2_file; do
+    echo "$(date) - Processing sample: $sample_name"
+    bwa mem -t "$threads" -R "@RG\tID:$sample_name\tPL:ILLUMINA\tPU:$sample_name\tLB:$sample_name\tSM:$sample_name" \
+        "$ref_path" "$r1_file" "$r2_file" -M \
+    | samtools view -@ "$threads" -bS - \
+    | samtools sort -@"$threads" -o "${output_folder}/${sample_name}.bam" -
+    echo "$(date) - Alignment completed for $sample_name"
+done < "$samplesheet"
+
+echo "$(date) - BWA alignment process completed."
+
+### SAMTOOLS POST-PROCESSING
+
+# Path to the folder containing the SAM files
+sam_folder="/nfs/home/volkhovskaya/aligning_reads"
+
+# Function to convert SAM to BAM and sort
+process_sample() {
+    local sample_name="$1"
+    local sam_file="${sam_folder}/${sample_name}.sam"
+    local bam_file="${sam_folder}/${sample_name}.bam"
+    local sorted_bam_file="${sam_folder}/${sample_name}_sorted.bam"
+
+    # Convert SAM to BAM
+    samtools view -@ 4 -bS "$sam_file" -o "$bam_file"
+
+    # Sort BAM file
+    samtools sort -@ 4 "$bam_file" -o "$sorted_bam_file"
+
+    # Index sorted BAM file
+    samtools index "$sorted_bam_file"
+
+    # Print completion message
+    echo "Processed sample: $sample_name"
+}
+
+# Iterate through SAM files in the sam_folder
+for sam_file in "$sam_folder"/*.sam; do
+    # Extract sample name from the filename
+    sample_name=$(basename "$sam_file" .sam)
+
+    # Process each sample
+    process_sample "$sample_name"
+done
+
+# here i with a command line transported all .bam files to a folder /bams_for_gatk
+
+### PICARD POST-PROCESSING
+
+# Define the directory containing the BAM files
+BAM_DIR="/nfs/home/volkhovskaya/bams_for_gatk"
+
+# Create a new output directory
+OUTPUT_DIR="/nfs/home/volkhovskaya/picard_metrics"
+mkdir -p "$OUTPUT_DIR"
+
+# Define the reference genome path
+REFERENCE_GENOME="/nfs/home/volkhovskaya/reference/GCA_002759435.2_Cand_auris_B8441_V2_genomic.fna"
+
+# Run Picard metrics for each BAM file
+for bam_file in ${BAM_DIR}/*.bam; do
+    # Get the filename without extension
+    filename=$(basename "$bam_file" .bam)
+    
+    # Run CollectWgsMetrics
+    java -jar picard.jar CollectWgsMetrics \
+        I="$bam_file" \
+        O="$OUTPUT_DIR/${filename}_wgs_metrics.txt" \
+        R="$REFERENCE_GENOME"
+
+    # Run CollectAlignSummaryMetrics
+    java -jar picard.jar CollectAlignmentSummaryMetrics \
+        R="$REFERENCE_GENOME" \
+        I="$bam_file" \
+        O="$OUTPUT_DIR/${filename}_align_summary_metrics.txt"
+done
+
+# Generate MultiQC report
+multiqc "$OUTPUT_DIR" --interactive -o "$OUTPUT_DIR"
+
+### GATK
+
+# Paths
+bam_dir="/nfs/home/volkhovskaya/bams_for_gatk"
+ref_genome="/nfs/home/volkhovskaya/reference/GCA_002759435.2_Cand_auris_B8441_V2_genomic.fna"
+gatk_dir="/nfs/home/volkhovskaya/gatk"
+
+echo "Starting GATK processing at: $(date)"
+
+# Step 1: HaplotypeCaller
+for bam_file in "$bam_dir"/*.bam; do
+    sample_name=$(basename "$bam_file" | cut -d'_' -f1)
+    gvcf_file="${sample_name}.g.vcf.gz"
+
+    echo "Processing $bam_file"
+
+    $gatk_dir/gatk HaplotypeCaller \
+        -I "$bam_file" \
+        -O "$gvcf_file" \
+        -R "$ref_genome" \
+        -ploidy 1 \
+        -ERC GVCF \
+        --create-output-variant-index
+
+    echo "HaplotypeCaller completed for $bam_file at: $(date)"
+done
+
+# Step 2: CombineGVCFs
+combined_gvcf="combined.g.vcf.gz"
+gvcf_files=($(ls "$bam_dir"/*.g.vcf.gz))
+
+echo "Combining GVCFs..."
+
+$gatk_dir/gatk CombineGVCFs \
+    -O "$combined_gvcf" \
+    "${gvcf_files[@]}"
+
+echo "CombineGVCFs completed at: $(date)"
+
+# Step 3: GenotypeGVCFs
+vcf_file="output.vcf.gz"
+
+echo "Genotyping GVCFs..."
+
+$gatk_dir/gatk GenotypeGVCFs \
+    -R "$ref_genome" \
+    -V "$combined_gvcf" \
+    -O "$vcf_file"
+
+echo "GenotypeGVCFs completed at: $(date)"
+
+echo "GATK processing completed at: $(date)"
+echo "All operations completed."
+
+### FILTRATION
+
+reference="/nfs/home/volkhovskaya/reference/GCA_002759435.2_Cand_auris_B8441_V2_genomic.fna"
+
+# Filtering SNPs
+gatk SelectVariants -V /nfs/home/volkhovskaya/gatk_out/output.vcf.gz -select-type SNP -O vcf_snps.vcf.gz
+
+gatk VariantFiltration \
+   -R $reference \
+   -V vcf_snps.vcf.gz \
+   -O filtered_vcf_snps.vcf.gz \
+   -filter "QD < 2.0" --filter-name "QD2" \
+   -filter "QUAL < 30.0" --filter-name "QUAL30" \
+   -filter "SOR > 3.0" --filter-name "SOR3" \
+   -filter "FS > 60.0" --filter-name "FS60" \
+   -filter "MQ < 40.0" --filter-name "MQ40"
+
+# Filtering indels
+gatk SelectVariants -V /nfs/home/volkhovskaya/gatk_out/output.vcf.gz -select-type INDEL -O vcf_indels.vcf.gz
+
+gatk VariantFiltration \
+   -R $reference \
+   -V vcf_indels.vcf.gz \
+   -O filtered_vcf_indels.vcf.gz \
+   -filter "QD < 2.0" --filter-name "QD2" \
+   -filter "QUAL < 30.0" --filter-name "QUAL30" \
+   -filter "SOR > 3.0" --filter-name "SOR3" \
+   -filter "FS > 200.0" --filter-name "FS200" 
+
+# Merging SNP and indel variants
+bcftools merge filtered_vcf_snps.vcf.gz filtered_vcf_indels.vcf.gz -o merged_filtered_vcf.vcf.gz
+
+# Applying DP filter
+bcftools filter -Oz -i 'FORMAT/DP>=10' merged_filtered_vcf.vcf.gz -o merged_filtered_vcf_DP10.vcf.gz
+
+# Generating stats with sample names included
+bcftools stats -s - merged_filtered_vcf_DP10.vcf.gz > merged_filtered_vcf_DP10.stat
+
+### VEP ANNOTATION
+
+# Download the GFF file
+wget -O GCA_002759435.2_Cand_auris_B8441_V2_genomic.gff.gz https://ftp.ncbi.nlm.nih.gov/genomes/all/GCA/002/759/435/GCA_002759435.2_Cand_auris_B8441_V2/GCA_002759435.2_Cand_auris_B8441_V2_genomic.gff.gz
+
+# Unzip the GFF file
+gunzip GCA_002759435.2_Cand_auris_B8441_V2_genomic.gff.gz
+
+# Filter out comments, sort, compress, and index the GFF file
+grep -v "#" GCA_002759435.2_Cand_auris_B8441_V2_genomic.gff | sort -k1,1 -k4,4n -k5,5n -t$'\t' | bgzip -c > ncbi_sort.gff.gz
+tabix -p gff ncbi_sort.gff.gz
+
+# Define paths
+input_vcf="/nfs/home/volkhovskaya/gatk_out/filtered_variants_HF_PASS_DP10.vcf.gz"
+reference="/nfs/home/volkhovskaya/reference/GCA_002759435.2_Cand_auris_B8441_V2_genomic.fna"
+
+# Run VEP
+vep -i "$input_vcf" --gff ncbi_sort.gff.gz --fasta "$reference" --format vcf --vcf --species Candida_auris -o output_vep.vcf
+
+echo "VEP annotation completed."
+
+### PLINK FOR PHYLOGENETICS
+
+bcftools filter -Oz -i 'FORMAT/DP>=10' filtered_vcf_snps.vcf.gz -o filtered_vcf_snps_DP10.vcf.gz
+
+plink --vcf filtered_vcf_snps_DP10.vcf.gz  --allow-extra-chr 
+plink --bfile plink --pca --allow-extra-chr
+
+### VCF PARSING
+
+bcftools view output_vep.vcf.gz 'B9J08_001850'
+grep "B9J08_000164" output_vep.vcf.gz 
+
+#################################
+
+### R SCRIPT FOR PCA PLOTS
+
+setwd("C:/Users/ol_va/Downloads")
+pca1 <- read.table("plink.eigenvec",sep=" ", header = FALSE, row.names = 1)
+pca1 <- pca1[, -c(1)]
+pc_colnames <- paste("PC", 1:20, sep = "")
+colnames(pca1) <- pc_colnames
+
+install.packages("ggplot2", "readxl", "ggfortify")
+library("ggplot2")
+library("readxl")
+
+info <- read_excel("strains_obj.xlsx")
+
+# simple PCA-plot coloured by region of the sample
+
+library(ggplot2)
+ggplot(pca1, aes(x = PC1, y = PC2, color = Region)) +
+  geom_point(size = 2) +
+  geom_text(aes(label = rownames(pca1)), nudge_x = 0.009, nudge_y = 0.17, size = 4, show.legend = FALSE) + 
+  labs(x = "PC1", y = "PC2", title = "PCA Plot") + 
+  theme_minimal()
+
+# PCA plots in Report
+
+library("ggfortify")
+
+pca_res <- prcomp(pca1, scale. = TRUE)
+p <- autoplot(pca_res, data = info, colour = 'Region', shape = FALSE, label.size = 2.5, scale = 0)
+p
+p + xlim(-0.07, 0.1) + ylim(-0.06, 0.105)
+p + xlim(-0.07, 0.00) + ylim(-0.04, 0.012)
+
+
